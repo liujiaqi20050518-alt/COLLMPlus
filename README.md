@@ -178,7 +178,7 @@ When implementing, you need set the hyper-parameters in the training config file
 - prompt_path: "prompt_/collm_movie.txt" # use the prompt with the user/item IDs
 - ckpt: step1_checkpoint_path # with pretrained LoRA
 ```
-Then run the same command to the stage 1. Our final CoLLM checkpoint can be downloaded at [here (7B)](https://xxxxx). 
+Then run the same command to the stage 1. Our final CoLLM checkpoint can be downloaded at [here (7B)](https://rec.ustc.edu.cn/share/f7c20240-5fb1-11ef-acb4-298118b1826d). 
 
 ** Notes: By default, at this stage, we utilize a pretrained collaborative model and focus solely on tuning the mapping module (an MLP). Alternatively, you have the option to fine-tune both the complete CIE module (mapping + collaborative model), with or without prior pretraining of the collaborative model. This approach might yield enhanced performance, as outlined in Section 5.3.2 of our paper.  This can be achieved by controlling the above two hyper-parameters: *```freeze_rec```* and *```pretrained_path```*.
 
