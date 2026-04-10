@@ -1,0 +1,8 @@
+PretrainedModels/
+collm-datasets/
+*.pth
+*.zip
+*.pkl
+*.pyc
+__pycache__/
+.DS_Store

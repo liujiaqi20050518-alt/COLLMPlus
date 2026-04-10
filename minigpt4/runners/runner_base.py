@@ -565,7 +565,8 @@ class RunnerBase:
                 if self.use_distributed:
                     sampler = DistributedSampler(
                         dataset,
-                        shuffle=is_train,
+                        # shuffle=is_train,  修改
+                        shuffle=False,
                         num_replicas=get_world_size(),
                         rank=get_rank(),
                     )
@@ -581,9 +582,11 @@ class RunnerBase:
                     num_workers=num_workers,
                     pin_memory=True,
                     sampler=sampler,
-                    shuffle=sampler is None and is_train,
+                    # shuffle=sampler is None and is_train,  修改
+                    shuffle=False,
                     collate_fn=collate_fn,
-                    drop_last=True if is_train else False,
+                    # drop_last=True if is_train else False, 修改
+                    drop_last=False,
                 )
                 loader = PrefetchLoader(loader)
 
@@ -691,11 +694,11 @@ class RunnerBase:
         if isinstance(stats, dict):
             log_stats = {**{f"{split_name}_{k}": v for k, v in stats.items()}}
             with open(os.path.join(self.output_dir, "log.txt"), "a") as f:
-                f.write(json.dumps(log_stats) + "\n")
+                f.write(json.dumps(log_stats, default=lambda x: x.tolist() if hasattr(x, 'tolist') else str(x)) + "\n")
         elif isinstance(stats, list):
             pass
 
     @main_process
     def log_config(self):
         with open(os.path.join(self.output_dir, "log.txt"), "a") as f:
-            f.write(json.dumps(self.config.to_dict(), indent=4) + "\n")
+            f.write(json.dumps(self.config.to_dict(), indent=4) + "\n")       

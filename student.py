@@ -17,7 +17,117 @@ import torch.nn.functional as F
 import omegaconf
 import random 
 import time
+# !!!!!!!!版本1！！！！！！！！！！！！！！！！！！！
 # os.environ["CUDA_VISIBLE_DEVICES"]="7"
+# class DynamicKDLoss(nn.Module):
+#     def __init__(self, gamma=0.01):
+#         super().__init__()
+#         # 调小 gamma 到 0.01，让更多中低频（长尾）物品能享受到蒸馏的红利
+#         # 比如出现 50 次的物品，alpha 也能保留 0.6 左右的蒸馏强度
+#         self.gamma = gamma
+
+#     def forward(self, student_logits, teacher_logits, true_labels, item_freqs):
+#         # 1. 基础长尾动态权重 Alpha
+#         alpha = torch.exp(-self.gamma * item_freqs)
+        
+#         # 2. Hard Loss (学生 vs 真实世界)
+#         hard_loss = F.binary_cross_entropy_with_logits(
+#             student_logits, true_labels.float(), reduction='none'
+#         )
+        
+#         # 3. 转化为概率
+#         student_probs = torch.sigmoid(student_logits)
+#         teacher_probs = torch.sigmoid(teacher_logits)
+        
+#         # 4. 🌟 新创新：平滑置信度 (Soft Confidence) 代替一刀切！
+#         # 老师的预测离真实标签越近，confidence 越大 (最高为1)；越离谱，confidence 越小 (最低趋近于0)
+#         teacher_error = torch.abs(true_labels.float() - teacher_probs)
+#         confidence = 1.0 - teacher_error 
+        
+#         # 5. 🌟 推荐专属 Soft Loss：均方误差 (MSE)
+#         # 强迫学生的概率分布在二维空间上向老师靠拢，不搞温度软化那套虚的
+#         soft_loss = F.mse_loss(student_probs, teacher_probs, reduction='none')
+        
+#         # 6. 究极融合公式
+#         # MSE 的值天然比 BCE 小很多，所以我们给蒸馏 Loss 乘一个放大系数 (比如 5.0)
+#         # 让长尾物品 (alpha高) 且老师有把握 (confidence高) 的样本，爆发出强大的蒸馏引导力！
+#         kd_weight = alpha * confidence * 8.0
+        
+#         total_loss = hard_loss + kd_weight * soft_loss
+        
+#         return total_loss.mean()
+
+
+# !!!!!!!!版本2！！！！！！！！！！！！！！！！！！！
+# class DynamicKDLoss(nn.Module):
+#     def __init__(self, gamma=0.01):
+#         super().__init__()
+#         self.gamma = gamma
+
+#     def forward(self, student_logits, teacher_logits, true_labels, item_freqs):
+#         alpha = torch.exp(-self.gamma * item_freqs)
+        
+#         hard_loss = F.binary_cross_entropy_with_logits(
+#             student_logits, true_labels.float(), reduction='none'
+#         )
+        
+#         # 🌟 开启 Hinton 蒸馏温度魔法
+#         T = 6.0  
+        
+#         student_probs = torch.sigmoid(student_logits)
+#         teacher_probs = torch.sigmoid(teacher_logits)
+        
+#         teacher_error = torch.abs(true_labels.float() - teacher_probs)
+#         confidence = 1.0 - teacher_error 
+        
+#         # 🌟 使用温度软化概率分布，挖掘大模型的“暗知识”
+#         student_probs_soft = torch.sigmoid(student_logits / T)
+#         teacher_probs_soft = torch.sigmoid(teacher_logits / T)
+        
+#         # 🌟 必须乘以 T^2 来补偿梯度缩放！
+#         # soft_loss = F.mse_loss(student_probs_soft, teacher_probs_soft, reduction='none') * (T * T)
+#         # 用交叉熵去对齐两个分布，梯度的指向会比距离绝对值（MSE）更加敏锐和精准！
+#         # 同样别忘了乘以 (T * T) 来补偿梯度缩放
+#         soft_loss = F.binary_cross_entropy(student_probs_soft, teacher_probs_soft, reduction='none') * (T * T)
+#         # 保持 8.0 的大模型辅导强度！
+#         kd_weight = alpha * confidence * 8.0
+        
+#         total_loss = hard_loss + kd_weight * soft_loss
+        
+#         return total_loss.mean()
+
+
+class DualLevelKDLoss(nn.Module):
+    def __init__(self, gamma=0.01, feat_weight=0.8): 
+        super().__init__()
+        self.gamma = gamma
+        self.feat_weight = feat_weight
+
+    def forward(self, student_logits, teacher_logits, student_feat, teacher_feat, true_labels, item_freqs):
+        alpha = torch.exp(-self.gamma * item_freqs)
+        
+        # 1. 硬标签
+        hard_loss = F.binary_cross_entropy_with_logits(student_logits, true_labels.float(), reduction='none')
+        
+        # 2. 软标签 (保持你的进度不变)
+        T = 5.0  
+        teacher_error = torch.abs(true_labels.float() - torch.sigmoid(teacher_logits))
+        confidence = 1.0 - teacher_error 
+        
+        stu_probs_soft = torch.sigmoid(student_logits / T)
+        tea_probs_soft = torch.sigmoid(teacher_logits / T)
+        soft_loss = F.binary_cross_entropy(stu_probs_soft, tea_probs_soft, reduction='none') * (T * T)
+        kd_weight = alpha * confidence * 8.0
+        
+        # 🌟 3. 跨模态表征对齐 (修复版：直接计算余弦相似度！)
+        # cosine_similarity 输出范围是 [-1, 1]。1代表完全同向。
+        # 我们用 1.0 减去它，让 Loss 的范围变成 [0, 2]，数值极其稳定！
+        cos_sim = F.cosine_similarity(student_feat, teacher_feat, dim=-1).unsqueeze(1)
+        feat_loss = 1.0 - cos_sim 
+        
+        # 终极融合！
+        total_loss = hard_loss + (kd_weight * soft_loss) + (self.feat_weight * feat_loss)
+        return total_loss.mean()
 
 def uAUC_me(user, predict, label):
     if not isinstance(predict,np.ndarray):
@@ -161,6 +271,29 @@ def run_a_trail(train_config,log_file=None, save_mode=False,save_file=None,need_
     valid_data = pd.read_pickle(data_dir+"valid_ood2.pkl")[['uid','iid','label']].values
     test_data = pd.read_pickle(data_dir+"test_ood2.pkl")[['uid','iid','label']].values
 
+
+
+    # === 🌟 核心数据融合开始 ===
+    print("🚀 正在加载大模型脑电波数据...")
+    # 请填入你真实生成的 npy 文件名！
+    teacher_logits = np.load("/root/autodl-tmp/CoLLM/result/20260330_214720/distill_soft_labels_20260330_214720.npy") 
+    if len(teacher_logits.shape) == 1:
+        teacher_logits = teacher_logits.reshape(-1, 1)
+    # ！！！！！！！！！！！！！！！！！！！！！！！！！！！！
+    print("🧠 正在加载大模型 4096 维文本语义特征空间...")
+    llm_features_path = "/root/autodl-tmp/CoLLM/collm-datasets/ml-1m/item_llm_features.npy"
+    teacher_features_all = torch.from_numpy(np.load(llm_features_path)).float().cuda()
+    train_data = train_data[:teacher_logits.shape[0]]
+    # ！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！
+    items = train_data[:, 1].astype(int)
+    item_counts = np.bincount(items)
+    item_freqs = item_counts[items].reshape(-1, 1)
+    
+    # 将 [uid, iid, label] 扩充为 [uid, iid, label, teacher_logit, item_freq]
+    train_data = np.concatenate([train_data, teacher_logits, item_freqs], axis=1)
+    print(f"✅ 数据融合完毕！新的训练集形状: {train_data.shape}")
+    # === 🌟 核心数据融合结束 ===
+
     if warm_or_cold is not None:
         if warm_or_cold == 'warm':
             test_data = pd.read_pickle(data_dir+"test_ood2.pkl")[['uid','iid','label', 'not_cold']]
@@ -223,8 +356,8 @@ def run_a_trail(train_config,log_file=None, save_mode=False,save_file=None,need_
     opt = torch.optim.Adam(model.parameters(),lr=train_config['lr'], weight_decay=train_config['wd'])
     early_stop = early_stoper(ref_metric='valid_auc',incerase=True,patience=train_config['patience'])
     # trainig part
-    criterion = nn.BCEWithLogitsLoss()
-
+    # criterion = nn.BCEWithLogitsLoss() ！！！！！！！！！！！！！修改
+    criterion = DualLevelKDLoss( gamma=0.01,feat_weight=0.05)
     if not need_train:
         model.load_state_dict(torch.load(save_file))
         model.eval()
@@ -262,17 +395,79 @@ def run_a_trail(train_config,log_file=None, save_mode=False,save_file=None,need_
         return 
     
 
+    # ！！！！！！！！！！！！！！！！！版本12使用的！！！！！！！！！！！！！！！
+    # for epoch in range(train_config['epoch']):
+    #     model.train()
+    #     for bacth_id, batch_data in enumerate(train_data_loader):
+    #         batch_data = batch_data.cuda()
+    #         # ui_matching = model(batch_data[:,0].long(),batch_data[:,1].long())
+    #         # loss = criterion(ui_matching,batch_data[:,-1].float())
+    #         # opt.zero_grad()
+    #         # loss.backward()
+    #         # opt.step()！！！！！！！！！！！！！！！！！修改过了
+    #         uids = batch_data[:, 0].long()
+    #         iids = batch_data[:, 1].long()
+            
+    #         # 因为数据被拼接了，真正的 label 现在固定在第 3 列 (索引为2)
+    #         # unsqueeze(1) 是为了把形状从 [Batch_Size] 变成 [Batch_Size, 1]，对齐公式计算
+    #         true_labels = batch_data[:, 2].float().unsqueeze(1)    
+    #         teacher_logits = batch_data[:, 3].float().unsqueeze(1) 
+    #         item_freqs = batch_data[:, 4].float().unsqueeze(1)     
+            
+    #         # 1. 小模型前向传播，算出自己的预测
+    #         student_logits = model(uids, iids).unsqueeze(1)
+            
+    #         # 2. 扔进你的专属超级引擎：DynamicKDLoss
+    #         loss = criterion(student_logits, teacher_logits, true_labels, item_freqs)
+    #         # ==========================================
+    #         # 🌟 核心修改结束
+    #         # ==========================================
+
+    #         opt.zero_grad()
+    #         loss.backward()
+    #         opt.step()
+
+
     for epoch in range(train_config['epoch']):
         model.train()
+        if epoch < 20:
+            current_feat_weight = 0.0
+        # elif epoch < 20:
+        #     # 20轮内从 0 线性增加到 0.1
+        #     current_feat_weight = 0.05 * (epoch - 10) / 10 
+        else:
+            current_feat_weight = 0.05
+
+        criterion.feat_weight = current_feat_weight
         for bacth_id, batch_data in enumerate(train_data_loader):
             batch_data = batch_data.cuda()
-            ui_matching = model(batch_data[:,0].long(),batch_data[:,1].long())
-            loss = criterion(ui_matching,batch_data[:,-1].float())
+            
+            uids = batch_data[:, 0].long()
+            iids = batch_data[:, 1].long()
+            
+            true_labels = batch_data[:, 2].float().unsqueeze(1)    
+            teacher_logits = batch_data[:, 3].float().unsqueeze(1) 
+            item_freqs = batch_data[:, 4].float().unsqueeze(1)     
+            
+            # 1. 小模型前向传播，算出自己的预测
+            student_logits = model(uids, iids).unsqueeze(1)
+            
+            # 🌟 2. 获取跨模态特征对齐的“两极”
+            # a) 拿到小模型 64 维经过投影仪拉伸后的 4096 维特征
+            student_feat = model.get_projected_item_emb(iids)
+            # b) 查表拿到大模型真实 4096 维文本语义特征
+            teacher_feat = teacher_features_all[iids]
+            
+            # 🌟 3. 扔进双层蒸馏超级引擎！
+            loss = criterion(student_logits, teacher_logits, student_feat, teacher_feat, true_labels, item_freqs)
+
             opt.zero_grad()
             loss.backward()
             opt.step()
-        
+
+
         if epoch% train_config['eval_epoch']==0:
+            
             model.eval()
             pre=[]
             label = []
@@ -387,9 +582,12 @@ def run_a_trail(train_config,log_file=None, save_mode=False,save_file=None,need_
 
 
 # # with prtrain version:
+
+
+# !!!!!!!!!!!!!!train训练！！！！！！！！！！！！！！！！！！！！！！
 if __name__=='__main__':
     # lr_ = [1e-1,1e-2,1e-3]
-    lr_=[1e-2] #1e-2
+    lr_=[1e-3] #1e-2
     dw_ = [1e-4]
     # embedding_size_ = [32, 64, 128, 156, 512]
     embedding_size_ = [64]
@@ -405,7 +603,7 @@ if __name__=='__main__':
                     "epoch": 5000,
                     "eval_epoch":1,
                     "patience":50,
-                    "batch_size":1024,
+                    "batch_size":2048,
                     "gcn_layer": 2
                 }
                 
@@ -417,11 +615,41 @@ if __name__=='__main__':
 
 
                 # save_path += "0918-OODv2_lgcn_ml1m_best_model_d64lr-0.01wd0.0001.pth" 生成lgcn图参数使用
-                save_file_name = save_path + "baseline_lgcn_ml1m_best.pth"
+                save_file_name = save_path + "student_dynamic_kd_best.pth"
                 run_a_trail(train_config=train_config, log_file=f, save_mode=True, save_file=save_file_name, need_train=True, warm_or_cold=None)
     if f is not None:
         f.close()
         
+# if __name__=='__main__':
+#     # 🌟 1. 严格锁定你创造历史的黄金配置（不要做任何修改）
+#     train_config={
+#         'lr': 1e-3, 
+#         'wd': 1e-4,
+#         'embedding_size': 64,
+#         "epoch": 5000,
+#         "eval_epoch":1,
+#         "patience":50,
+#         "batch_size":2048,
+#         "gcn_layer": 2
+#     }
+    
+#     # 🌟 2. 指向你那颗 0.6356 的极品神丹的绝对路径
+#     # （请核对一下这个路径是不是你最新跑出最好成绩的那个 pth 文件）
+#     save_file_name = "/root/autodl-tmp/CoLLM/lgcnresult/student_dynamic_kd_best.pth"
+    
+#     print("\n" + "🔥"*10 + " 正在评估 Warm (热门/活跃) 试卷 " + "🔥"*10)
+#     # 🌟 3. need_train=False 极其关键！这意味着不训练，直接加载权重去考试
+#     run_a_trail(train_config=train_config, 
+#                 save_file=save_file_name, 
+#                 need_train=False,  
+#                 warm_or_cold='warm') 
+    
+#     print("\n" + "❄️"*10 + " 正在评估 Cold (冷门/长尾/OOD) 试卷 " + "❄️"*10)
+#     # 🌟 4. 测试 Cold 数据
+#     run_a_trail(train_config=train_config, 
+#                 save_file=save_file_name, 
+#                 need_train=False,  
+#                 warm_or_cold='cold')
 
 
 

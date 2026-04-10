@@ -185,8 +185,14 @@ class RecBaseTask(BaseTask):
             results_logits = []
             labels = []
             users = []
+            max_steps = len(data_loader)
+            current_step = 0
             for samples in metric_logger.log_every(data_loader, print_freq, header):
                 # samples = next(data_loader)
+                if current_step >= max_steps:
+                    print(f"\n🛑 触发强制刹车！已到达真实边界 ({max_steps})，阻止无限循环！")
+                    break
+                current_step += 1
                 samples = prepare_sample(samples, cuda_enabled=cuda_enabled)
                 eval_output = self.valid_step(model=model, samples=samples)
                 # results_loss.append(eval_output['loss'].item())
@@ -233,7 +239,7 @@ class RecBaseTask(BaseTask):
                 print("finished comput auc.....")
             else:
                 auc = roc_auc_score(labels_.cpu().numpy(), results_logits_.cpu().numpy())
-                uauc = uAUC_me(users_.cpu().numpy(), results_logits_.cput().numpy(), labels_.cpu().numpy())
+                uauc = uAUC_me(users_.cpu().numpy(), results_logits_.cpu().numpy(), labels_.cpu().numpy())
             
 
             if is_dist_avail_and_initialized():
@@ -249,6 +255,49 @@ class RecBaseTask(BaseTask):
             logging.info("Averaged stats: " + str(metric_logger.global_avg()) + " ***auc: " + str(auc) + " ***uauc:" +str(uauc) )
             print("rank_0 auc:", str(auc_rank0))
             
+            
+            save_dir = "result"
+            # 2. 生成动态时间戳后缀
+            run_id = time.strftime("%Y%m%d_%H%M%S")
+            save_dir = os.path.join(save_dir, f"{run_id}")
+            os.makedirs(save_dir, exist_ok=True)
+            # 3. 获取张量并转成 numpy
+            logits_arr = results_logits_.cpu().numpy()
+            labels_arr = labels_.cpu().numpy()
+            
+            # 4. 拼接带时间戳的文件路径
+            npy_soft_path = os.path.join(save_dir, f"distill_soft_labels_{run_id}.npy")
+            npy_gt_path = os.path.join(save_dir, f"distill_ground_truth_{run_id}.npy")
+            txt_path = os.path.join(save_dir, f"distill_results_view_{run_id}.txt")
+            
+            # 5. 保存供代码读取的 .npy 文件
+            np.save(npy_soft_path, logits_arr)
+            np.save(npy_gt_path, labels_arr)
+            
+            # 6. ⭐️ 把评估指标组装成炫酷的表头 (修复 Tuple 格式化 Bug)
+            acc_val = metric_logger.meters['acc'].global_avg
+            loss_val = metric_logger.meters['loss'].global_avg
+            
+            # 防弹检测：如果 uauc 是元组，只提取第 0 个位置的真实分数
+            uauc_float = uauc[0] if isinstance(uauc, tuple) else uauc
+            
+            info_header = (
+                f"=== 大模型评估成绩单 (Run ID: {run_id}) ===\n"
+                f"AUC Score : {auc_rank0:.6f}\n"
+                f"uAUC Score: {uauc_float:.6f}\n"
+                f"Accuracy  : {acc_val:.6f}\n"
+                f"Loss      : {loss_val:.6f}\n"
+                f"===========================================\n"
+                f"真实标签(Label)\t预测概率(SoftLabel)"
+            )
+            
+            # 7. 拼成两列并带上表头保存
+            combined_data = np.column_stack((labels_arr, logits_arr))
+            np.savetxt(txt_path, combined_data, fmt="%d\t%.6f", delimiter="\t", header=info_header, comments="")
+            
+            print(f"🎉 成功！大模型的软标签已提取！(批次: {run_id})")
+            print(f"📁 代码用 NPY: {os.path.abspath(npy_soft_path)}")
+            print(f"👁️ 人类看 TXT: {os.path.abspath(txt_path)}")
             if use_auc:
                 results = {
                     'agg_metrics':auc,

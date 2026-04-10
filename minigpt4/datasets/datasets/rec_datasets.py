@@ -221,7 +221,7 @@ class MoiveOOData(RecBaseDataset):
 
         ## warm test:
         if "warm" in ann_paths:
-            self.annotation = self.annotation[self.annotation['warm'].isin([1])].copy()
+            self.annotation = self.annotation[self.annotation['not_cold'].isin([1])].copy()
         if "cold" in ann_paths:
             self.annotation = self.annotation[self.annotation['not_cold'].isin([0])].copy()
         

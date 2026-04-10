@@ -121,8 +121,20 @@ class LightGCN(nn.Module):
         self.config = config
         self.padding_index = 0
         # self.dataset = dataset
+        self.llm_dim = 4096 # 这是你提取的 item_llm_features.npy 的列数
+        self.projector = nn.Linear(self.config['embedding_size'], self.llm_dim)
+        # self.projector = nn.Sequential(
+        #     nn.Linear(self.config['embedding_size'], 512),
+        #     nn.BatchNorm1d(512), 
+        #     nn.GELU(),
+        #     nn.Linear(512, self.llm_dim)
+        # )
         self.__init_weight()
-
+    def get_projected_item_emb(self, item_indices):
+        # 拿到 64 维原始向量
+        item_embs = self.embedding_item(item_indices)
+        # 通过投影仪映射到 4096 维
+        return self.projector(item_embs)
     def __init_weight(self):
         self.num_users  = self.config.user_num
         self.num_items  = self.config.item_num
