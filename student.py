@@ -17,6 +17,7 @@ import torch.nn.functional as F
 import omegaconf
 import random 
 import time
+
 # !!!!!!!!版本1！！！！！！！！！！！！！！！！！！！
 # os.environ["CUDA_VISIBLE_DEVICES"]="7"
 # class DynamicKDLoss(nn.Module):
@@ -96,39 +97,355 @@ import time
         
 #         return total_loss.mean()
 
+# # 版本3，加入跨模态表征对齐（修复版）
+# class DualLevelKDLoss(nn.Module):
+#     def __init__(self, gamma=0.01, feat_weight=0.8): 
+#         super().__init__()
+#         self.gamma = gamma
+#         self.feat_weight = feat_weight
 
-class DualLevelKDLoss(nn.Module):
-    def __init__(self, gamma=0.01, feat_weight=0.8): 
+#     def forward(self, student_logits, teacher_logits, student_feat, teacher_feat, true_labels, item_freqs):
+#         alpha = torch.exp(-self.gamma * item_freqs)
+        
+#         # 1. 硬标签
+#         hard_loss = F.binary_cross_entropy_with_logits(student_logits, true_labels.float(), reduction='none')
+        
+#         # 2. 软标签 (保持你的进度不变)
+#         T = 5.0  
+#         teacher_error = torch.abs(true_labels.float() - torch.sigmoid(teacher_logits))
+#         confidence = 1.0 - teacher_error 
+        
+#         stu_probs_soft = torch.sigmoid(student_logits / T)
+#         tea_probs_soft = torch.sigmoid(teacher_logits / T)
+#         soft_loss = F.binary_cross_entropy(stu_probs_soft, tea_probs_soft, reduction='none') * (T * T)
+#         kd_weight = alpha * confidence * 8.0
+        
+#         # 🌟 3. 跨模态表征对齐 (修复版：直接计算余弦相似度！)
+#         # cosine_similarity 输出范围是 [-1, 1]。1代表完全同向。
+#         # 我们用 1.0 减去它，让 Loss 的范围变成 [0, 2]，数值极其稳定！
+#         cos_sim = F.cosine_similarity(student_feat, teacher_feat, dim=-1).unsqueeze(1)
+#         feat_loss = 1.0 - cos_sim 
+        
+#         # 终极融合！
+#         total_loss = hard_loss + (kd_weight * soft_loss) + (self.feat_weight * feat_loss)
+#         return total_loss.mean()
+#===========================================================================================================
+# def dct1d(x):
+#     """标准的 1D DCT 变换 (保持不变)"""
+#     N = x.shape[-1]
+#     x_even = x[:, ::2]
+#     x_odd = x[:, 1::2].flip([1])
+#     v = torch.cat([x_even, x_odd], dim=1)
+#     V = torch.fft.fft(v, dim=1)
+#     k = -torch.arange(N, device=x.device).float() * np.pi / (2 * N)
+#     W_r = torch.cos(k)
+#     W_i = torch.sin(k)
+#     return 2 * (V.real * W_r - V.imag * W_i)
+
+
+
+def dct1d(x):
+    """
+    对输入张量的最后一个维度进行 1D 离散余弦变换 (DCT-II)
+    x: (batch, dim)
+    """
+    N = x.shape[-1]
+    # 重新排列序列以利用 FFT 计算 DCT
+    x_even = x[:, ::2]
+    x_odd = x[:, 1::2].flip([1])
+    v = torch.cat([x_even, x_odd], dim=1)
+    
+    # 快速傅里叶变换
+    V = torch.fft.fft(v, dim=1)
+    
+    # 根据 DCT-II 定义进行相位补偿
+    k = -torch.arange(N, device=x.device).float() * np.pi / (2 * N)
+    W_r = torch.cos(k)
+    W_i = torch.sin(k)
+    
+    # 提取实部作为 DCT 结果
+    dct_output = 2 * (V.real * W_r - V.imag * W_i)
+    return dct_output
+
+class SpectralKDLoss(nn.Module):
+    def __init__(self, gamma=0.01, feat_dim=4096, feat_weight=0.01): 
         super().__init__()
         self.gamma = gamma
         self.feat_weight = feat_weight
+        self.low_bound = feat_dim // 4   
+        self.mid_bound = feat_dim // 2   
 
     def forward(self, student_logits, teacher_logits, student_feat, teacher_feat, true_labels, item_freqs):
         alpha = torch.exp(-self.gamma * item_freqs)
+        teacher_probs = torch.sigmoid(teacher_logits)
+        confidence = 1.0 - torch.abs(true_labels.float() - teacher_probs)
         
-        # 1. 硬标签
+        T = 5.0
+        soft_loss = F.binary_cross_entropy(
+            torch.sigmoid(student_logits/T), 
+            torch.sigmoid(teacher_logits/T), 
+            reduction='none'
+        ) * (T * T)
+        
+        # ==========================================
+        # 🌟 核心修复：特征归一化 (L2 Normalization)
+        # ==========================================
+        # 这一步极其关键！把向量的长度缩放到 1。
+        # 这样能保证后续计算的平方差 (MSE) 被死死限制在安全范围内，彻底消除梯度爆炸！
+        student_feat_norm = F.normalize(student_feat, p=2, dim=-1)
+        teacher_feat_norm = F.normalize(teacher_feat, p=2, dim=-1)
+        
+        # 3. 对归一化后的安全特征进行真正的频率域拆解
+        s_spectrum = dct1d(student_feat_norm)
+        t_spectrum = dct1d(teacher_feat_norm)
+        
+        spec_diff = (s_spectrum - t_spectrum)**2
+        
+        loss_low = spec_diff[:, :self.low_bound].mean(dim=-1, keepdim=True)
+        loss_mid = spec_diff[:, self.low_bound:self.mid_bound].mean(dim=-1, keepdim=True)
+        loss_high = spec_diff[:, self.mid_bound:].mean(dim=-1, keepdim=True)
+        
+        # 放大低频 (2.5)，削弱高频 (0.1)
+        weighted_feat_loss = 2.5 * loss_low + 1.0 * loss_mid + 0.1 * loss_high
+        
         hard_loss = F.binary_cross_entropy_with_logits(student_logits, true_labels.float(), reduction='none')
-        
-        # 2. 软标签 (保持你的进度不变)
-        T = 5.0  
-        teacher_error = torch.abs(true_labels.float() - torch.sigmoid(teacher_logits))
-        confidence = 1.0 - teacher_error 
-        
-        stu_probs_soft = torch.sigmoid(student_logits / T)
-        tea_probs_soft = torch.sigmoid(teacher_logits / T)
-        soft_loss = F.binary_cross_entropy(stu_probs_soft, tea_probs_soft, reduction='none') * (T * T)
         kd_weight = alpha * confidence * 8.0
         
-        # 🌟 3. 跨模态表征对齐 (修复版：直接计算余弦相似度！)
-        # cosine_similarity 输出范围是 [-1, 1]。1代表完全同向。
-        # 我们用 1.0 减去它，让 Loss 的范围变成 [0, 2]，数值极其稳定！
-        cos_sim = F.cosine_similarity(student_feat, teacher_feat, dim=-1).unsqueeze(1)
-        feat_loss = 1.0 - cos_sim 
-        
-        # 终极融合！
-        total_loss = hard_loss + (kd_weight * soft_loss) + (self.feat_weight * feat_loss)
+        # 融合计算
+        total_loss = hard_loss + (kd_weight * soft_loss) + (self.feat_weight * weighted_feat_loss)
         return total_loss.mean()
 
+# class SpectralKDLoss(nn.Module):
+#     def __init__(self, gamma=0.01, feat_dim=4096, feat_weight=0.01): 
+#         super().__init__()
+#         self.gamma = gamma
+#         self.feat_weight = feat_weight
+        
+#         # 定义频段切分点
+#         self.low_bound = feat_dim // 4   
+#         self.mid_bound = feat_dim // 2   
+
+#     def forward(self, student_logits, teacher_logits, student_feat, teacher_feat, true_labels, item_freqs):
+#         # 1. 计算长尾权重 Alpha (越冷门越接近 1，越热门越接近 0)
+#         # item_freqs 的形状通常是 [Batch_Size, 1]
+#         alpha = torch.exp(-self.gamma * item_freqs)
+        
+#         teacher_probs = torch.sigmoid(teacher_logits)
+#         confidence = 1.0 - torch.abs(true_labels.float() - teacher_probs)
+        
+#         # 2. 预测层软标签蒸馏
+#         T = 5.0
+#         soft_loss = F.binary_cross_entropy(
+#             torch.sigmoid(student_logits/T), 
+#             torch.sigmoid(teacher_logits/T), 
+#             reduction='none'
+#         ) * (T * T)
+        
+#         # 3. 真正的频率域特征蒸馏 (包含 L2 归一化安全阀)
+#         student_feat_norm = F.normalize(student_feat, p=2, dim=-1)
+#         teacher_feat_norm = F.normalize(teacher_feat, p=2, dim=-1)
+        
+#         s_spectrum = dct1d(student_feat_norm)
+#         t_spectrum = dct1d(teacher_feat_norm)
+        
+#         spec_diff = (s_spectrum - t_spectrum)**2
+        
+#         # 提取各个频段的差异能量，形状均为 [Batch_Size, 1]
+#         loss_low = spec_diff[:, :self.low_bound].mean(dim=-1, keepdim=True)
+#         loss_mid = spec_diff[:, self.low_bound:self.mid_bound].mean(dim=-1, keepdim=True)
+#         loss_high = spec_diff[:, self.mid_bound:].mean(dim=-1, keepdim=True)
+        
+#         # ==========================================
+#         # 🌟 核心创新：流行度感知的动态低频加权
+#         # ==========================================
+#         # 基础骨架权重保底为 2.0，动态增益部分由 alpha 控制（最高加 1.0）。
+#         # 因为 alpha 和 loss_low 的形状都是 [Batch_Size, 1]，这里会自动实现逐样本加权！
+#         dynamic_low_weight = 2.0 + (1.0 * alpha)
+        
+#         # 融合分段特征损失
+#         weighted_feat_loss = (dynamic_low_weight * loss_low) + (1.0 * loss_mid) + (0.1 * loss_high)
+        
+#         # 4. 计算 Hard Loss 并汇总
+#         hard_loss = F.binary_cross_entropy_with_logits(student_logits, true_labels.float(), reduction='none')
+#         kd_weight = alpha * confidence * 8.0
+        
+#         # 使用外部控制的 self.feat_weight (建议保持 0.01 并配合预热)
+#         total_loss = hard_loss + (kd_weight * soft_loss) + (self.feat_weight * weighted_feat_loss)
+        
+#         return total_loss.mean()
+
+# class SpectralKDLoss(nn.Module):
+#     def __init__(self, gamma=0.01, feat_dim=4096, feat_weight=0.05): # 🌟 因为用了余弦，权重可以安心回到 0.05
+#         super().__init__()
+#         self.gamma = gamma
+#         self.feat_weight = feat_weight
+#         self.low_bound = feat_dim // 4   
+#         self.mid_bound = feat_dim // 2   
+
+#     def forward(self, student_logits, teacher_logits, student_feat, teacher_feat, true_labels, item_freqs):
+#         # 1. 基础长尾权重
+#         alpha = torch.exp(-self.gamma * item_freqs)
+#         teacher_probs = torch.sigmoid(teacher_logits)
+#         confidence = 1.0 - torch.abs(true_labels.float() - teacher_probs)
+        
+#         # 2. 预测层蒸馏
+#         T = 5.0
+#         soft_loss = F.binary_cross_entropy(
+#             torch.sigmoid(student_logits/T), 
+#             torch.sigmoid(teacher_logits/T), 
+#             reduction='none'
+#         ) * (T * T)
+        
+#         # ==========================================
+#         # 🌟 核心替换部分：频域分段余弦相似度
+#         # ==========================================
+#         # 不需要 F.normalize，直接对原始特征做 DCT 变换
+#         s_spectrum = dct1d(student_feat)
+#         t_spectrum = dct1d(teacher_feat)
+        
+#         # 对三个频段分别计算 余弦相似度 (输出范围 [-1, 1])
+#         cos_low = F.cosine_similarity(s_spectrum[:, :self.low_bound], t_spectrum[:, :self.low_bound], dim=-1).unsqueeze(1)
+#         cos_mid = F.cosine_similarity(s_spectrum[:, self.low_bound:self.mid_bound], t_spectrum[:, self.low_bound:self.mid_bound], dim=-1).unsqueeze(1)
+#         cos_high = F.cosine_similarity(s_spectrum[:, self.mid_bound:], t_spectrum[:, self.mid_bound:], dim=-1).unsqueeze(1)
+        
+#         # 转换为 Loss 形式 (范围 [0, 2])
+#         loss_low = 1.0 - cos_low
+#         loss_mid = 1.0 - cos_mid
+#         loss_high = 1.0 - cos_high
+        
+#         # 应用你成功的动态流行度加权 (依然是极冷门=3.0, 极热门=2.0)
+#         dynamic_low_weight = 2.0 + (1.0 * alpha)
+        
+#         # 融合分段特征损失
+#         weighted_feat_loss = (dynamic_low_weight * loss_low) + (1.0 * loss_mid) + (0.1 * loss_high)
+#         # ==========================================
+        
+#         # 4. 汇总 (这就是你说的那行，保持不变！)
+#         hard_loss = F.binary_cross_entropy_with_logits(student_logits, true_labels.float(), reduction='none')
+#         kd_weight = alpha * confidence * 8.0
+        
+#         total_loss = hard_loss + (kd_weight * soft_loss) + (self.feat_weight * weighted_feat_loss)
+        
+#         return total_loss.mean()
+
+# class UniformKDLoss(nn.Module):
+#     def __init__(self, gamma=0.01, feat_weight=0.05, uniform_weight=0.02): 
+#         super().__init__()
+#         self.gamma = gamma
+#         self.feat_weight = feat_weight
+#         self.uniform_weight = uniform_weight
+
+#     def forward(self, student_logits, teacher_logits, student_feat, teacher_feat, true_labels, item_freqs):
+#         # 1. 基础长尾权重
+#         alpha = torch.exp(-self.gamma * item_freqs)
+#         teacher_probs = torch.sigmoid(teacher_logits)
+#         confidence = 1.0 - torch.abs(true_labels.float() - teacher_probs)
+        
+#         T = 5.0
+#         soft_loss = F.binary_cross_entropy(
+#             torch.sigmoid(student_logits/T), 
+#             torch.sigmoid(teacher_logits/T), 
+#             reduction='none'
+#         ) * (T * T)
+        
+#         # 🌟 引擎 1：纯净的全局余弦
+#         cos_sim = F.cosine_similarity(student_feat, teacher_feat, dim=-1).unsqueeze(1)
+#         feat_loss = 1.0 - cos_sim
+        
+#         # ==========================================
+#         # 🌟 引擎 2：特征均匀性惩罚 (内存安全版 🚀)
+#         # ==========================================
+#         student_feat_norm = F.normalize(student_feat, p=2, dim=-1)
+        
+#         # a. 矩阵乘法算相似度矩阵，大小只有 [2048, 2048]，绝不爆显存！
+#         sim_matrix = torch.matmul(student_feat_norm, student_feat_norm.T)
+        
+#         # b. 生成对角线掩码（去除自己和自己的比较）
+#         mask = torch.eye(sim_matrix.size(0), dtype=torch.bool, device=sim_matrix.device)
+        
+#         # c. 数学转换：惩罚 exp(-2 * sq_dist) 等价于惩罚 exp(4 * sim)
+#         # 我们希望不同物品的 sim_matrix 越小越好
+#         uniform_loss = torch.log(torch.mean(torch.exp(4.0 * sim_matrix[~mask])))
+#         # ==========================================
+        
+#         # 4. 汇总总损失
+#         hard_loss = F.binary_cross_entropy_with_logits(student_logits, true_labels.float(), reduction='none')
+#         kd_weight = alpha * confidence * 8.0
+        
+#         total_loss = hard_loss + \
+#                      (kd_weight * soft_loss) + \
+#                      (self.feat_weight * feat_loss) + \
+#                      (self.uniform_weight * uniform_loss)
+                     
+#         return total_loss.mean()
+
+
+# class DualVictoryKDLoss(nn.Module):
+#     def __init__(self, gamma=0.01, feat_dim=4096, feat_weight=1.0): 
+#         super().__init__()
+#         self.gamma = gamma
+#         self.feat_weight = feat_weight # 接收外部传入的预热比例 (取消预热时默认为 1.0)
+        
+#         # ==============================================
+#         # ⚙️ 参数一：动态力度 (决定了向大模型靠拢的绝对力量)
+#         # ==============================================
+#         self.max_weight = 0.05  # 极冷门物品的最高拉扯力 (你的神丹配置)
+#         self.min_weight = 0.01  # 极热门物品的保底拉扯力
+        
+#         # ==============================================
+#         # ⚙️ 参数二：动态及格线 (Margin，方案一的核心创新)
+#         # ==============================================
+#         self.strict_margin = 0.99  # 冷门物品及格线：必须极度相似 (听老师的)
+#         self.loose_margin = 0.30   # 热门物品及格线：大方向没错就行 (放过它)
+
+#     def forward(self, student_logits, teacher_logits, student_feat, teacher_feat, true_labels, item_freqs):
+#         # 1. 计算长尾衰减系数 alpha (越冷门越接近 1.0，越热门越接近 0.0)
+#             alpha = torch.exp(-self.gamma * item_freqs)
+        
+#         # 2. 软标签置信度 
+#             teacher_probs = torch.sigmoid(teacher_logits)
+#             confidence = 1.0 - torch.abs(true_labels.float() - teacher_probs)
+        
+#         # 3. 软标签交叉熵 Loss 
+#             T = 5.0
+#             soft_loss = F.binary_cross_entropy(
+#                 torch.sigmoid(student_logits/T), 
+#                 torch.sigmoid(teacher_logits/T), 
+#                 reduction='none'
+#             ) * (T * T)
+        
+#         # ==========================================================
+#         # 🌟 绝杀逻辑：频率自适应宽容度 (Frequency-Adaptive Margin)
+#         # ==========================================================
+#         # 计算每个样本真实的余弦相似度, shape: [Batch_Size, 1], 值域 [-1, 1]
+#             cos_sim = F.cosine_similarity(student_feat, teacher_feat, dim=-1).unsqueeze(1)
+        
+#         # 为每个样本动态计算专属的“及格线”
+#         # - 纯冷门 (alpha≈1) -> 及格线逼近 0.99
+#         # - 超热门 (alpha≈0) -> 及格线逼近 0.30
+#             target_margin = self.loose_margin + (self.strict_margin - self.loose_margin) * alpha
+        
+#         # Margin Loss：核心中的核心！
+#         # 如果 cos_sim >= target_margin，相减为负数，clamp 后直接变成 0 (不产生梯度)
+#         # 如果 cos_sim < target_margin，才会产生正向 Loss，逼迫模型学习
+#             sample_cos_loss = torch.clamp(target_margin - cos_sim, min=0.0)
+        
+#         # 继续施加动态权重 (力度的缩放)
+#             dynamic_feat_weight = self.min_weight + (self.max_weight - self.min_weight) * alpha
+        
+#         # 计算最终的特征蒸馏 Loss
+#             weighted_feat_loss = (dynamic_feat_weight * sample_cos_loss).mean() * self.feat_weight
+#         # ==========================================================
+        
+#         # 4. 汇总总损失
+#             hard_loss = F.binary_cross_entropy_with_logits(student_logits, true_labels.float(), reduction='none')
+#             kd_weight = alpha * confidence * 8.0
+        
+#         # 总 Loss = 图协同过滤 + (软标签蒸馏) + (带截断的特征对齐)
+#             total_loss = hard_loss + (kd_weight * soft_loss) + weighted_feat_loss
+        
+#             return total_loss.mean()
+        
 def uAUC_me(user, predict, label):
     if not isinstance(predict,np.ndarray):
         predict = np.array(predict)
@@ -357,7 +674,7 @@ def run_a_trail(train_config,log_file=None, save_mode=False,save_file=None,need_
     early_stop = early_stoper(ref_metric='valid_auc',incerase=True,patience=train_config['patience'])
     # trainig part
     # criterion = nn.BCEWithLogitsLoss() ！！！！！！！！！！！！！修改
-    criterion = DualLevelKDLoss( gamma=0.01,feat_weight=0.05)
+    criterion = SpectralKDLoss(gamma=0.01, feat_dim=4096)
     if not need_train:
         model.load_state_dict(torch.load(save_file))
         model.eval()
@@ -430,14 +747,10 @@ def run_a_trail(train_config,log_file=None, save_mode=False,save_file=None,need_
 
     for epoch in range(train_config['epoch']):
         model.train()
-        if epoch < 20:
-            current_feat_weight = 0.0
-        # elif epoch < 20:
-        #     # 20轮内从 0 线性增加到 0.1
-        #     current_feat_weight = 0.05 * (epoch - 10) / 10 
-        else:
-            current_feat_weight = 0.05
-
+        target_weight = 0.01 
+        current_feat_weight = target_weight
+            
+        
         criterion.feat_weight = current_feat_weight
         for bacth_id, batch_data in enumerate(train_data_loader):
             batch_data = batch_data.cuda()
@@ -602,7 +915,7 @@ if __name__=='__main__':
                     'embedding_size': embedding_size,
                     "epoch": 5000,
                     "eval_epoch":1,
-                    "patience":50,
+                    "patience":100,
                     "batch_size":2048,
                     "gcn_layer": 2
                 }
@@ -620,36 +933,36 @@ if __name__=='__main__':
     if f is not None:
         f.close()
         
-# if __name__=='__main__':
-#     # 🌟 1. 严格锁定你创造历史的黄金配置（不要做任何修改）
-#     train_config={
-#         'lr': 1e-3, 
-#         'wd': 1e-4,
-#         'embedding_size': 64,
-#         "epoch": 5000,
-#         "eval_epoch":1,
-#         "patience":50,
-#         "batch_size":2048,
-#         "gcn_layer": 2
-#     }
+if __name__=='__main__':
+    # 🌟 1. 严格锁定你创造历史的黄金配置（不要做任何修改）
+    train_config={
+        'lr': 1e-4, 
+        'wd': 1e-4,
+        'embedding_size': 64,
+        "epoch": 5000,
+        "eval_epoch":1,
+        "patience":50,
+        "batch_size":2048,
+        "gcn_layer": 2
+    }
     
-#     # 🌟 2. 指向你那颗 0.6356 的极品神丹的绝对路径
-#     # （请核对一下这个路径是不是你最新跑出最好成绩的那个 pth 文件）
-#     save_file_name = "/root/autodl-tmp/CoLLM/lgcnresult/student_dynamic_kd_best.pth"
+    # 🌟 2. 指向你那颗 0.6356 的极品神丹的绝对路径
+    # （请核对一下这个路径是不是你最新跑出最好成绩的那个 pth 文件）
+    save_file_name = "/root/autodl-tmp/CoLLM/lgcnresult/student_dynamic_kd_best.pth"
     
-#     print("\n" + "🔥"*10 + " 正在评估 Warm (热门/活跃) 试卷 " + "🔥"*10)
-#     # 🌟 3. need_train=False 极其关键！这意味着不训练，直接加载权重去考试
-#     run_a_trail(train_config=train_config, 
-#                 save_file=save_file_name, 
-#                 need_train=False,  
-#                 warm_or_cold='warm') 
+    print("\n" + "🔥"*10 + " 正在评估 Warm (热门/活跃) 试卷 " + "🔥"*10)
+    # 🌟 3. need_train=False 极其关键！这意味着不训练，直接加载权重去考试
+    run_a_trail(train_config=train_config, 
+                save_file=save_file_name, 
+                need_train=False,  
+                warm_or_cold='warm') 
     
-#     print("\n" + "❄️"*10 + " 正在评估 Cold (冷门/长尾/OOD) 试卷 " + "❄️"*10)
-#     # 🌟 4. 测试 Cold 数据
-#     run_a_trail(train_config=train_config, 
-#                 save_file=save_file_name, 
-#                 need_train=False,  
-#                 warm_or_cold='cold')
+    print("\n" + "❄️"*10 + " 正在评估 Cold (冷门/长尾/OOD) 试卷 " + "❄️"*10)
+    # 🌟 4. 测试 Cold 数据
+    run_a_trail(train_config=train_config, 
+                save_file=save_file_name, 
+                need_train=False,  
+                warm_or_cold='cold')
 
 
 

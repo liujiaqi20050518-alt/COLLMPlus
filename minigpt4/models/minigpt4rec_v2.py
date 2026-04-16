@@ -92,7 +92,7 @@ class MiniGPT4Rec_v2(Rec2Base):
         self.rec_encoder = self.init_rec_encoder(rec_model, rec_config, rec_precision)
         # try:
         if self.rec_encoder is not None and pretrained_rec != "not_have":
-            self.rec_encoder.load_state_dict(torch.load(pretrained_rec, map_location="cpu"))
+            self.rec_encoder.load_state_dict(torch.load(pretrained_rec, map_location="cpu"),strict=False)
             print("successfully load the pretrained model......")
         # except:
         #     # print(pretrained_rec)
