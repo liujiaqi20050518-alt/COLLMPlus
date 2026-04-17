@@ -13,7 +13,7 @@ print(f"👉 数据类型: {item_llm_embs.dtype}")
 
 # 3. 查看具体内容（比如看第 1 号电影的前 10 个特征值）
 print("\n🔍 来看一眼第 1 号电影（通常是 Toy Story）的前 10 个维度的脑电波：")
-print(np.size(item_llm_embs[1]))
+print(item_llm_embs[1])
 
 # 4. 做一个简单的健康度体检
 print("\n🏥 矩阵健康度检查：")

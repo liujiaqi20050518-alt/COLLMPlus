@@ -17,6 +17,35 @@ import torch.nn.functional as F
 import omegaconf
 import random 
 import time
+import scipy.sparse as sp # 新增依赖
+# =========== 新增：构建 KNN 图滤波器 ===========
+def build_graph_filter(features, num_items, k=10, alpha=0.45):
+    """根据大模型特征构建 KNN 图，并返回稀疏图滤波器 H = I - alpha * L_tilde"""
+    print(f"🌐 正在构建 KNN 图滤波器 (k={k}, alpha={alpha})...")
+    norm_feat = F.normalize(features, p=2, dim=-1)
+    sim_matrix = torch.matmul(norm_feat, norm_feat.T)
+    
+    _, topk_indices = torch.topk(sim_matrix, k=k+1, dim=-1)
+    
+    row_indices = torch.arange(num_items).view(-1, 1).expand(-1, k+1).flatten().cuda()
+    col_indices = topk_indices.flatten().cuda()
+    values = torch.ones_like(row_indices, dtype=torch.float32).cuda()
+    
+    indices = torch.stack([row_indices, col_indices])
+    A = torch.sparse_coo_tensor(indices, values, (num_items, num_items)).coalesce()
+    
+    degree = torch.sparse.sum(A, dim=1).to_dense()
+    d_inv_sqrt = torch.pow(degree, -0.5)
+    d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
+    
+    A_dense = A.to_dense()
+    D_inv_sqrt_mat = torch.diag(d_inv_sqrt)
+    L_sym = torch.eye(num_items).cuda() - torch.mm(torch.mm(D_inv_sqrt_mat, A_dense), D_inv_sqrt_mat)
+    
+    H = torch.eye(num_items).cuda() - alpha * L_sym
+    H_sparse = H.to_sparse()
+    print("✅ 滤波器构建完成！")
+    return H_sparse
 
 # !!!!!!!!版本1！！！！！！！！！！！！！！！！！！！
 # os.environ["CUDA_VISIBLE_DEVICES"]="7"
@@ -446,6 +475,41 @@ class SpectralKDLoss(nn.Module):
         
 #             return total_loss.mean()
         
+
+# =========== 新增：正宗的 FreqD 特征蒸馏 Loss ===========
+class FreqDKDLoss(nn.Module):
+    def __init__(self, gamma=0.01, feat_weight=0.05): 
+        super().__init__()
+        self.gamma = gamma
+        self.feat_weight = feat_weight
+
+    def forward(self, student_logits, teacher_logits, 
+                s_feat_filtered_batch, t_feat_filtered_batch, 
+                true_labels, item_freqs):
+        
+        # 1. 基础长尾衰减权重 (保留你现有的逻辑)
+        alpha = torch.exp(-self.gamma * item_freqs)
+        teacher_probs = torch.sigmoid(teacher_logits)
+        confidence = 1.0 - torch.abs(true_labels.float() - teacher_probs)
+        
+        # 2. 预测层软标签蒸馏
+        T = 5.0
+        soft_loss = F.binary_cross_entropy(
+            torch.sigmoid(student_logits/T), 
+            torch.sigmoid(teacher_logits/T), 
+            reduction='none'
+        ) * (T * T)
+        
+        # 3. FreqD 特征蒸馏：直接计算图滤波后的均方误差
+        feat_loss = F.mse_loss(s_feat_filtered_batch, t_feat_filtered_batch, reduction='none').mean(dim=-1, keepdim=True)
+        
+        # 4. 融合计算
+        hard_loss = F.binary_cross_entropy_with_logits(student_logits, true_labels.float(), reduction='none')
+        kd_weight = alpha * confidence * 8.0
+        
+        total_loss = hard_loss + (kd_weight * soft_loss) + (self.feat_weight * feat_loss)
+        return total_loss.mean()
+# ========================================================
 def uAUC_me(user, predict, label):
     if not isinstance(predict,np.ndarray):
         predict = np.array(predict)
@@ -635,6 +699,12 @@ def run_a_trail(train_config,log_file=None, save_mode=False,save_file=None,need_
     user_num = train_data[:,0].max() + 1
     item_num = train_data[:,1].max() + 1
 
+    # =========== 新增：预构建滤波器并处理大模型特征 ===========
+    H_filter = build_graph_filter(teacher_features_all, int(item_num), k=10, alpha=0.01) 
+    print("⚡ 预计算大模型的全局图滤波特征 (仅需计算一次)...")
+    filtered_teacher_feat_all = torch.sparse.mm(H_filter, teacher_features_all)
+    # ==========================================================
+
     lgcn_config={
         "user_num": int(user_num),
         "item_num": int(item_num),
@@ -674,7 +744,12 @@ def run_a_trail(train_config,log_file=None, save_mode=False,save_file=None,need_
     early_stop = early_stoper(ref_metric='valid_auc',incerase=True,patience=train_config['patience'])
     # trainig part
     # criterion = nn.BCEWithLogitsLoss() ！！！！！！！！！！！！！修改
-    criterion = SpectralKDLoss(gamma=0.01, feat_dim=4096)
+    # criterion = SpectralKDLoss(gamma=0.01, feat_dim=4096)
+    # =========== 修改：实例化新 Loss 并准备全局 ID ===========
+    criterion = FreqDKDLoss(gamma=0.01, feat_weight=0.05)
+    all_iids = torch.arange(int(item_num)).long().cuda()
+    # =========================================================
+
     if not need_train:
         model.load_state_dict(torch.load(save_file))
         model.eval()
@@ -747,7 +822,7 @@ def run_a_trail(train_config,log_file=None, save_mode=False,save_file=None,need_
 
     for epoch in range(train_config['epoch']):
         model.train()
-        target_weight = 0.01 
+        target_weight = 0.01
         current_feat_weight = target_weight
             
         
@@ -765,15 +840,27 @@ def run_a_trail(train_config,log_file=None, save_mode=False,save_file=None,need_
             # 1. 小模型前向传播，算出自己的预测
             student_logits = model(uids, iids).unsqueeze(1)
             
-            # 🌟 2. 获取跨模态特征对齐的“两极”
-            # a) 拿到小模型 64 维经过投影仪拉伸后的 4096 维特征
-            student_feat = model.get_projected_item_emb(iids)
-            # b) 查表拿到大模型真实 4096 维文本语义特征
-            teacher_feat = teacher_features_all[iids]
+            # # 🌟 2. 获取跨模态特征对齐的“两极”
+            # # a) 拿到小模型 64 维经过投影仪拉伸后的 4096 维特征
+            # student_feat = model.get_projected_item_emb(iids)
+            # # b) 查表拿到大模型真实 4096 维文本语义特征
+            # teacher_feat = teacher_features_all[iids]
             
-            # 🌟 3. 扔进双层蒸馏超级引擎！
-            loss = criterion(student_logits, teacher_logits, student_feat, teacher_feat, true_labels, item_freqs)
+            # # 🌟 3. 扔进双层蒸馏超级引擎！
+            # loss = criterion(student_logits, teacher_logits, student_feat, teacher_feat, true_labels, item_freqs)
 
+            # =========== 修改：使用全局稀疏滤波替代原有的特征提取 ===========
+            # a) 获取小模型的全量物品特征
+            student_feat_all = model.get_projected_item_emb(all_iids)
+            # b) 应用轻量级图滤波器
+            filtered_student_feat_all = torch.sparse.mm(H_filter, student_feat_all)
+            # c) 提取当前 Batch 的过滤后特征
+            s_feat_batch = filtered_student_feat_all[iids]
+            t_feat_batch = filtered_teacher_feat_all[iids]
+            
+            # d) 计算双层蒸馏 Loss
+            loss = criterion(student_logits, teacher_logits, s_feat_batch, t_feat_batch, true_labels, item_freqs)
+            # ================================================================
             opt.zero_grad()
             loss.backward()
             opt.step()
