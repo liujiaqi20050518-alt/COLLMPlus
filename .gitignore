@@ -1,6 +1,4 @@
 PretrainedModels/
-results/
-lgcnresults/
 collm-datasets/
 *.pth
 *.zip
