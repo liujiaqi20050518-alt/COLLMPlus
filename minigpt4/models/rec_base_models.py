@@ -115,26 +115,63 @@ Define models here
 """
 
 class LightGCN(nn.Module):
-    def __init__(self, 
-                 config):
+    # def __init__(self, 
+    #              config):
+    #     super(LightGCN, self).__init__()
+    #     self.config = config
+    #     self.padding_index = 0
+    #     # self.dataset = dataset
+    #     self.llm_dim = 4096 # 这是你提取的 item_llm_features.npy 的列数
+    #     self.projector = nn.Linear(self.config['embedding_size'], self.llm_dim)
+    #     # self.projector = nn.Sequential(
+    #     #     nn.Linear(self.config['embedding_size'], 512),
+    #     #     nn.BatchNorm1d(512), 
+    #     #     nn.GELU(),
+    #     #     nn.Linear(512, self.llm_dim)
+    #     # )
+    #     self.__init_weight()
+    def __init__(self, config, llm_features=None): # 🌟 新增 llm_features 参数
         super(LightGCN, self).__init__()
         self.config = config
         self.padding_index = 0
-        # self.dataset = dataset
-        self.llm_dim = 4096 # 这是你提取的 item_llm_features.npy 的列数
+        self.llm_dim = 4096 
+        
+        # 🌟 新增：语义投影层（将 4096 维 LLM 特征映射回 64 维协同过滤空间）
+        # self.semantic_proj = nn.Linear(self.llm_dim, self.config.embed_size)
+        self.semantic_proj = nn.Sequential(
+            nn.Linear(self.llm_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(p=0.1),
+            nn.Linear(512, self.config.embed_size)
+        )
+        
+        # 原有的 64 -> 4096 投影仪（用于蒸馏损失计算）保持不变
         self.projector = nn.Linear(self.config['embedding_size'], self.llm_dim)
-        # self.projector = nn.Sequential(
-        #     nn.Linear(self.config['embedding_size'], 512),
-        #     nn.BatchNorm1d(512), 
-        #     nn.GELU(),
-        #     nn.Linear(512, self.llm_dim)
-        # )
+        
+        # 🌟 将全量特征保存到模型中
+        self.register_buffer('llm_features', llm_features) # 使用 register_buffer 保证它随模型移动到正确的设备
+        
         self.__init_weight()
+    # def get_projected_item_emb(self, item_indices):
+    #     # 拿到 64 维原始向量
+    #     item_embs = self.embedding_item(item_indices)
+    #     # 通过投影仪映射到 4096 维
+    #     return self.projector(item_embs)
     def get_projected_item_emb(self, item_indices):
-        # 拿到 64 维原始向量
-        item_embs = self.embedding_item(item_indices)
-        # 通过投影仪映射到 4096 维
-        return self.projector(item_embs)
+        """
+        专属蒸馏通道：让大模型成为 MLP 唯一的老师
+        """
+        if getattr(self, 'items_semantic_emb', None) is not None:
+            # 🌟 直接提取【未 detach】的语义特征，并通过 projector 还原到 4096 维
+            # 这样，蒸馏 Loss (FreqD/MSE) 就成了唯一能更新 MLP 的信号源，
+            # 强迫 MLP 学习纯正的大模型语义规律！
+            return self.projector(self.items_semantic_emb[item_indices])
+        else:
+            # 防呆保底逻辑
+            all_users, all_items = self.computer()
+            item_embs = all_items[item_indices]
+            return self.projector(item_embs)
     def __init_weight(self):
         self.num_users  = self.config.user_num
         self.num_items  = self.config.item_num
@@ -189,19 +226,70 @@ class LightGCN(nn.Module):
             graph = self.__dropout_x(self.Graph, keep_prob)
         return graph
     
+    # def computer(self):
+    #     """
+    #     propagate methods for lightGCN
+    #     """       
+    #     users_emb = self.embedding_user.weight
+    #     items_emb = self.embedding_item.weight
+    #     all_emb = torch.cat([users_emb, items_emb])
+    #     self.Graph = self.Graph.to(users_emb.device)
+    #     #   torch.split(all_emb , [self.num_users, self.num_items])
+    #     embs = [all_emb]
+    #     if self.dropout_flag:
+    #         if self.training:
+    #             print("droping")
+    #             g_droped = self.__dropout(self.keep_prob)
+    #         else:
+    #             g_droped = self.Graph        
+    #     else:
+    #         g_droped = self.Graph    
+        
+    #     for layer in range(self.n_layers):
+    #         if self.A_split:
+    #             temp_emb = []
+    #             for f in range(len(g_droped)):
+    #                 temp_emb.append(torch.sparse.mm(g_droped[f], all_emb))
+    #             side_emb = torch.cat(temp_emb, dim=0)
+    #             all_emb = side_emb
+    #         else:
+    #             all_emb = torch.sparse.mm(g_droped, all_emb)
+    #         embs.append(all_emb)
+    #     embs = torch.stack(embs, dim=1)
+    #     #print(embs.size())
+    #     light_out = torch.mean(embs, dim=1)
+    #     users, items = torch.split(light_out, [self.num_users, self.num_items])
+    #     return users, items
     def computer(self):
         """
-        propagate methods for lightGCN
+        解耦架构：使用 Stop-Gradient 隔离负采样偏差
         """       
         users_emb = self.embedding_user.weight
-        items_emb = self.embedding_item.weight
-        all_emb = torch.cat([users_emb, items_emb])
+        items_id_emb = self.embedding_item.weight
+        
+        if getattr(self, 'llm_features', None) is not None:
+            llm_feat_norm = F.normalize(self.llm_features, p=2, dim=-1)
+            
+            # 1. 计算出带有梯度的语义向量，保存下来供后续蒸馏使用
+            self.items_semantic_emb = self.semantic_proj(llm_feat_norm)
+            
+            # 2. 🌟 绝杀：梯度截断 (Stop-Gradient)
+            # 在图传播和计算 BCE Loss 时，强行切断流向 MLP 的梯度！
+            # items_semantic_emb.detach() 作为一个常量参与推荐计算，
+            # 彻底杜绝 BCE Loss 因为负采样而把 "冷门特征" 判定为负样本。
+            items_emb_0 = items_id_emb + self.items_semantic_emb.detach() 
+        else:
+            self.items_semantic_emb = None
+            items_emb_0 = items_id_emb
+            
+        all_emb = torch.cat([users_emb, items_emb_0])
         self.Graph = self.Graph.to(users_emb.device)
-        #   torch.split(all_emb , [self.num_users, self.num_items])
+        
         embs = [all_emb]
+        
+        # ===== 下方图卷积传播不变 =====
         if self.dropout_flag:
             if self.training:
-                print("droping")
                 g_droped = self.__dropout(self.keep_prob)
             else:
                 g_droped = self.Graph        
@@ -218,11 +306,13 @@ class LightGCN(nn.Module):
             else:
                 all_emb = torch.sparse.mm(g_droped, all_emb)
             embs.append(all_emb)
+            
         embs = torch.stack(embs, dim=1)
-        #print(embs.size())
         light_out = torch.mean(embs, dim=1)
-        users, items = torch.split(light_out, [self.num_users, self.num_items])
-        return users, items
+        users_final, items_final_graph = torch.split(light_out, [self.num_users, self.num_items])
+        
+        # User 走图平滑，Item 走纯净特征，且屏蔽了负采样污染
+        return users_final, items_emb_0
     
     def user_encoder(self, users, all_users=None):
         if all_users is None:

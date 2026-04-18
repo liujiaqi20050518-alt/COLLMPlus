@@ -700,9 +700,9 @@ def run_a_trail(train_config,log_file=None, save_mode=False,save_file=None,need_
     item_num = train_data[:,1].max() + 1
 
     # =========== 新增：预构建滤波器并处理大模型特征 ===========
-    H_filter = build_graph_filter(teacher_features_all, int(item_num), k=10, alpha=0.01) 
-    print("⚡ 预计算大模型的全局图滤波特征 (仅需计算一次)...")
-    filtered_teacher_feat_all = torch.sparse.mm(H_filter, teacher_features_all)
+    # H_filter = build_graph_filter(teacher_features_all, int(item_num), k=10, alpha=0.01) 
+    # print("⚡ 预计算大模型的全局图滤波特征 (仅需计算一次)...")
+    # filtered_teacher_feat_all = torch.sparse.mm(H_filter, teacher_features_all)
     # ==========================================================
 
     lgcn_config={
@@ -737,7 +737,9 @@ def run_a_trail(train_config,log_file=None, save_mode=False,save_file=None,need_
 
 
     # model = MatrixFactorization(mf_config).cuda()
-    model = LightGCN(lgcn_config).cuda()
+    # model = LightGCN(lgcn_config).cuda()
+    # model._set_graph(gnndata.Graph)
+    model = LightGCN(lgcn_config, llm_features=teacher_features_all).cuda()
     model._set_graph(gnndata.Graph)
     
     opt = torch.optim.Adam(model.parameters(),lr=train_config['lr'], weight_decay=train_config['wd'])
@@ -746,7 +748,7 @@ def run_a_trail(train_config,log_file=None, save_mode=False,save_file=None,need_
     # criterion = nn.BCEWithLogitsLoss() ！！！！！！！！！！！！！修改
     # criterion = SpectralKDLoss(gamma=0.01, feat_dim=4096)
     # =========== 修改：实例化新 Loss 并准备全局 ID ===========
-    criterion = FreqDKDLoss(gamma=0.01, feat_weight=0.05)
+    criterion = FreqDKDLoss(gamma=0.01, feat_weight=1)
     all_iids = torch.arange(int(item_num)).long().cuda()
     # =========================================================
 
@@ -840,27 +842,26 @@ def run_a_trail(train_config,log_file=None, save_mode=False,save_file=None,need_
             # 1. 小模型前向传播，算出自己的预测
             student_logits = model(uids, iids).unsqueeze(1)
             
-            # # 🌟 2. 获取跨模态特征对齐的“两极”
-            # # a) 拿到小模型 64 维经过投影仪拉伸后的 4096 维特征
-            # student_feat = model.get_projected_item_emb(iids)
-            # # b) 查表拿到大模型真实 4096 维文本语义特征
-            # teacher_feat = teacher_features_all[iids]
+            # 🌟 2. 获取用于对齐的特征：
+            # 注意：因为 model 内部现在已经把语义和 ID 融合了
+            # 所以 get_projected_item_emb 获取到的是【融合后】的物品再放大到 4096 维的特征
+            student_feat = model.get_projected_item_emb(iids)
+            teacher_feat = teacher_features_all[iids]
             
-            # # 🌟 3. 扔进双层蒸馏超级引擎！
-            # loss = criterion(student_logits, teacher_logits, student_feat, teacher_feat, true_labels, item_freqs)
-
-            # =========== 修改：使用全局稀疏滤波替代原有的特征提取 ===========
-            # a) 获取小模型的全量物品特征
-            student_feat_all = model.get_projected_item_emb(all_iids)
-            # b) 应用轻量级图滤波器
-            filtered_student_feat_all = torch.sparse.mm(H_filter, student_feat_all)
-            # c) 提取当前 Batch 的过滤后特征
-            s_feat_batch = filtered_student_feat_all[iids]
-            t_feat_batch = filtered_teacher_feat_all[iids]
+            # 🌟 3. 计算总 Loss：
+            # 这里如果你用的依然是 FreqDKDLoss，你需要确保 Loss 函数接收这五个参数
+            # （直接把特征喂给 Loss 即可，不需要在外面做额外的稀疏滤波了，因为底层特征已经很稳）
+            student_feat_norm = F.normalize(student_feat, p=2, dim=-1)
+            teacher_feat_norm = F.normalize(teacher_feat, p=2, dim=-1)
             
-            # d) 计算双层蒸馏 Loss
-            loss = criterion(student_logits, teacher_logits, s_feat_batch, t_feat_batch, true_labels, item_freqs)
-            # ================================================================
+            # Cosine Loss: 1.0 - 余弦相似度 (当方向完全一致时，Loss为0)
+            align_loss = 1.0 - (student_feat_norm * teacher_feat_norm).sum(dim=-1).mean()
+            
+            # 4. 计算原来的推荐 BCE Loss
+            bce_loss = F.binary_cross_entropy_with_logits(student_logits, true_labels)
+            
+            # 5. 总 Loss (feat_weight 我们给一个非常强烈的信号：2.0)
+            loss = bce_loss + 2.0 * align_loss
             opt.zero_grad()
             loss.backward()
             opt.step()
